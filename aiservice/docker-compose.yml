@@ -1,0 +1,26 @@
+services:
+  collection:
+    build: .
+    container_name: aiservice_container
+    restart: always
+    ports:
+      - "8001:8001"
+    
+    # Python 코드에서 사용할 환경 변수를 설정합니다.
+    # environment:
+    #   # DB 호스트는 다른 docker-compose의 DB 컨테이너 이름(mysql_db_container)을 사용합니다.
+    #   DB_HOST: 'mysql_db_container' 
+    #   DB_USER: 'root'
+    #   DB_PASSWORD: 'asdf'
+    #   DB_NAME: 'my_app_db'
+      
+    # DB 서비스와 동일한 공유 네트워크를 사용하도록 설정합니다.
+    networks:
+      my-shared-network:
+        aliases:
+          - aiservice
+
+# 사용할 네트워크가 외부에서 생성된 것임을 정의합니다.
+networks:
+  my-shared-network:
+    external: true

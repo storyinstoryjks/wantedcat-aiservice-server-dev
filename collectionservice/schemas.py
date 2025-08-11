@@ -1,3 +1,4 @@
+from typing import Optional
 from pydantic import BaseModel
 from datetime import datetime
 
@@ -21,6 +22,9 @@ class Event(EventCreate):
 
     class Config:
         orm_mode = True # SQLAlchemy 모델과 호환되도록 설정
+                        # pydantic v1 방식 : 경고뜸 실행은 됨.
+                        # 경고까지 안뜨게 하려면? v2로 변경
+                        # 예) model_config = ConfigDict(from_attributes=True)
         
 # --- User 관련 스키마 ---
 class UserBase(BaseModel):
@@ -35,7 +39,7 @@ class User(UserBase):
     stream_key: Optional[str] = None
 
     class Config:
-        orm_mode = True
+        orm_mode = True # 예) model_config = ConfigDict(from_attributes=True)
 
 # --- 스트리밍 서버 인증용 스키마 ---
 class StreamAuthRequest(BaseModel):

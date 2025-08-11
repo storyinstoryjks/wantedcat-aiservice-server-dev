@@ -1,7 +1,7 @@
 services:
   collection:
     build: .
-    container_name: backend
+    container_name: collectionservice_container
     restart: always
     ports:
       # Python 코드가 5000번 포트를 사용하므로, 5000번 포트를 열어줍니다.
@@ -17,7 +17,9 @@ services:
       
     # DB 서비스와 동일한 공유 네트워크를 사용하도록 설정합니다.
     networks:
-      - my-shared-network
+      my-shared-network:
+        aliases:
+          - collectionservice  # <-- 다른 compose에서도 이 이름으로 DNS 접근 가능
 
 # 사용할 네트워크가 외부에서 생성된 것임을 정의합니다.
 networks:

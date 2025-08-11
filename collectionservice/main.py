@@ -45,14 +45,24 @@ async def generate_sas_url(request: schemas.SasRequest):
         container_name=container_name,
         blob_name=blob_name,
         account_key=blob_service_client.credential.account_key,
-        permission=BlobSasPermissions(write=True),
+        permission=BlobSasPermissions(write=True, read=True), # write:쓰기 권한, read:읽기 권한(이게 있어야 다운로드 가능)
         expiry=datetime.utcnow() + timedelta(minutes=10)
     )
 
-    sas_url = f"https://{blob_service_client.account_name}.blob.core.windows.net/{container_name}/{blob_name}?{sas_token}"
-    blob_url = f"https://{blob_service_client.account_name}.blob.core.windows.net/{container_name}/{blob_name}"
+    sas_url = f"https://{blob_service_client.account_name}.blob.core.windows.net/{container_name}/{blob_name}?{sas_token}" # 업로드용 주소
+    blob_url = f"https://{blob_service_client.account_name}.blob.core.windows.net/{container_name}/{blob_name}" # 다운로드용 주소
 
     return schemas.SasResponse(sasUrl=sas_url, blobUrl=blob_url)
+
+@app.get("/api/blobs/list")
+async def list_blobs(container: str, prefix: str, _: str = Depends(get_api_key)):
+    """
+    prefix로 특정 container의 blob 리스트를 반환하는 컨트롤러
+    ex) origin(container)/고객id(prefix)/기쁨|나비|...
+    """
+    container_client = blob_service_client.get_container_client(container)
+    names = [b.name for b in container_client.list_blobs(name_starts_with=prefix)]
+    return {"blobs": names}
 
 @app.post("/api/events", dependencies=[Depends(get_api_key)])
 async def receive_event_data(
