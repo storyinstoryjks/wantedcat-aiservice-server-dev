@@ -33,5 +33,5 @@ EXPOSE 8001
 # Gunicorn을 사용하여 Flask 앱 실행 (INFO 로그만 남게. 실제 배포시 사용할 거)
 # CMD ["gunicorn", "--bind", "0.0.0.0:8001", "--access-logfile", "-", "--error-logfile", "-", "--log-level", "info", "--timeout", "120", "app:app"]
 
-# Gunicorn을 사용하여 Flask 앱 실행 (모든 로깅 남게. 디버깅용. 배포시에는 위에거 사용)
-CMD ["gunicorn", "--bind", "0.0.0.0:8001", "--access-logfile", "-", "--error-logfile", "-", "--log-level", "debug", "--timeout", "300", "app:app"]
+# Gunicorn을 사용하여 Flask 앱 실행 (모든 로깅 남게. 디버깅용. 배포시에는 위에거 사용) (timeout=240분)
+CMD ["gunicorn", "--bind", "0.0.0.0:8001", "--access-logfile", "-", "--error-logfile", "-", "--log-level", "debug", "--timeout", "14400", "app:app"]
