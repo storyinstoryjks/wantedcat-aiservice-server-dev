@@ -19,7 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 from urllib.parse import urljoin
 import requests
 from tqdm import tqdm
-
+import mimetypes
 
 
 def customer_upload_image_download_via_api(
@@ -139,18 +139,6 @@ def bbox_predict_and_points(model, # best.pt (yolo(0)모델)
     return name_and_bbox
 
 
-# def customer_upload_image_download_via_api(
-#     api_base_url: str,            # 예: "http://localhost:8000"
-#     x_api_key: str,                 # Depends(get_api_key)에서 요구하는 값
-#     container_name: str,          # 예: "origin"
-#     blob_prefix: str,             # 예: "your_user_id"
-#     cat_name: str,                # 예: "나비"
-#     download_dir: str,            # 예: "BASE_URL/tmp/origin/your_user_id/"
-#     exts: tuple = (".jpg", ".jpeg", ".png"),
-#     timeout_sec: int = 60,
-# ):
-
-
 def download_datasets_via_api(api_base_url,   # 'http://collectionservice:8000'
                               x_api_key,      # Depends(get_api_key)에서 요구하는 값
                               container_name, # 'datasets'
@@ -260,3 +248,192 @@ def download_datasets_via_api(api_base_url,   # 'http://collectionservice:8000'
 
     print(f"[저장완료] prefix: {blob_name} / 파일 개수: {file_cnt} / 로컬 경로: {download_dir}")
     return file_cnt
+
+
+class TqdmFileReader:
+    """requests가 read()로 읽을 때마다 tqdm를 갱신하는 래퍼 (Content-Length는 헤더로 고정)"""
+    def __init__(self, f, pbar):
+        self.f = f
+        self.pbar = pbar
+    def read(self, amt=None):
+        chunk = self.f.read(amt)
+        if chunk:
+            self.pbar.update(len(chunk))
+        return chunk
+    def __getattr__(self, name):
+        return getattr(self.f, name)
+
+def upload_datasets_via_api(api_base_url, x_api_key, container_name, blob_name, local_dir,
+                            timeout_sec=14400, overwrite=True):
+    api_base = api_base_url.rstrip("/") + "/"
+    sas_url_endpoint = urljoin(api_base, "api/sas/generate")
+    headers_json = {"X-API-Key": x_api_key, "Content-Type": "application/json"}
+
+    # 업로드 대상 수집 (data.yaml + train/** + valid/**)
+    targets = []
+    yaml_path = os.path.join(local_dir, "data.yaml")
+    if os.path.isfile(yaml_path):
+        targets.append(("data.yaml", yaml_path))
+    for split in ("train", "valid"):
+        split_dir = os.path.join(local_dir, split)
+        if not os.path.isdir(split_dir):
+            continue
+        for root, _, files in os.walk(split_dir):
+            for fname in files:
+                ap = os.path.join(root, fname)
+                rp = os.path.relpath(ap, start=local_dir).replace(os.sep, "/")
+                targets.append((rp, ap))
+    if not targets:
+        print(f"[경고] 업로드할 파일이 없습니다: {local_dir}")
+        return 0
+
+    # 총 바이트
+    total_bytes = sum((os.path.getsize(ap) for _, ap in targets if os.path.exists(ap)), 0)
+    uploaded_files = 0
+
+    with requests.Session() as s, tqdm(total=total_bytes, unit="B", unit_scale=True, unit_divisor=1024,
+                                       desc="Uploading Azure Blob Storage-dataset") as pbar_total:
+        for rel_path, abs_path in targets:
+            remote_blob = f"{blob_name.rstrip('/')}/{rel_path.lstrip('/')}"
+            ctype, _ = mimetypes.guess_type(abs_path)
+            if ctype is None:
+                if abs_path.lower().endswith(".txt"):
+                    ctype = "text/plain"
+                elif abs_path.lower().endswith((".yaml", ".yml")):
+                    ctype = "text/yaml"
+                else:
+                    ctype = "application/octet-stream"
+
+            # SAS URL 생성 (쓰기)
+            payload = {
+                "fileName": remote_blob,
+                "containerName": container_name,
+                "permission": "w",
+                "overwrite": bool(overwrite),
+            }
+            r = s.post(sas_url_endpoint, json=payload, headers=headers_json, timeout=timeout_sec)
+            r.raise_for_status()
+            sas_url = r.json().get("sasUrl")
+            if not sas_url:
+                print(f"[경고] SAS URL 생성 실패: {remote_blob}")
+                continue
+
+            file_size = os.path.getsize(abs_path)
+
+            # === 중요 변경점 시작 ===
+            # 1) Content-Length 명시
+            # 2) PUT 헤더에서 커스텀 'X-API-Key' 제거
+            # 3) data는 파일 객체(비 generator)로 전달
+            put_headers = {
+                "x-ms-blob-type": "BlockBlob",
+                "Content-Type": ctype,
+                "Content-Length": str(file_size),
+                # 선택: "x-ms-version": "2021-12-02",  # 버전 강제 지정이 필요할 때만
+            }
+
+            with open(abs_path, "rb") as f, \
+                 tqdm(total=file_size, unit="B", unit_scale=True, unit_divisor=1024,
+                      desc=rel_path, leave=False) as pbar_file:
+                reader = TqdmFileReader(f, pbar_file)  # 진행률 갱신용 래퍼
+                resp = s.put(sas_url, data=reader, headers=put_headers, timeout=timeout_sec)
+                try:
+                    resp.raise_for_status()
+                except Exception as e:
+                    print(f"[오류] 업로드 실패: {remote_blob} -> {e}")
+                    continue
+                pbar_total.update(file_size)
+            # === 중요 변경점 끝 ===
+
+            uploaded_files += 1
+
+    print(f"[업로드완료] prefix: {blob_name} / 파일 개수: {uploaded_files} / 총 바이트: {total_bytes}")
+    return uploaded_files
+
+
+
+def build_predict_dir(user_id: str,
+                      base_dir: str = "/app/tmp/bbox_predict",
+                      conf: float = 0.5,
+                      iou: float = 0.7) -> str:
+    """
+    예) /app/tmp/bbox_predict/your_user_id/conf0.5_iou_0.7/predict
+    """
+    return os.path.join(base_dir, user_id, f"conf{conf}_iou_{iou}", "predict")
+
+
+def purge_directory(path: str,
+                    remove_root: bool = False,
+                    dry_run: bool = False,
+                    safety_prefix: str = "/app/tmp/bbox_predict"):
+    """
+    path 하위의 모든 파일/폴더를 삭제한다.
+    - remove_root=True 이면 path 폴더 자체도 삭제
+    - dry_run=True 이면 실제 삭제 대신 삭제 예정 항목만 출력
+    - safety_prefix: 안전장치(이 prefix 밖 경로는 삭제 거부)
+
+    Returns: (files_deleted, dirs_deleted, bytes_freed)
+    """
+    apath = os.path.abspath(path)
+    if not apath.startswith(os.path.abspath(safety_prefix)):
+        raise ValueError(f"Safety check failed: {apath} is outside {safety_prefix}")
+
+    if not os.path.isdir(apath):
+        print(f"[정보] 대상 디렉토리가 없습니다: {apath}")
+        return (0, 0, 0)
+
+    files_deleted = 0
+    dirs_deleted = 0
+    bytes_freed = 0
+
+    # 하위부터 지우기
+    for root, dirs, files in os.walk(apath, topdown=False):
+        for fname in files:
+            fp = os.path.join(root, fname)
+            try:
+                size = os.path.getsize(fp)
+            except OSError:
+                size = 0
+
+            if dry_run:
+                print("[DRY-RUN] 파일 삭제:", fp)
+            else:
+                try:
+                    os.remove(fp)
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    print(f"[경고] 파일 삭제 실패: {fp} -> {e}")
+                    continue
+
+            bytes_freed += size
+            files_deleted += 1
+
+        for dname in dirs:
+            dp = os.path.join(root, dname)
+            if dry_run:
+                print("[DRY-RUN] 폴더 삭제:", dp)
+                dirs_deleted += 1
+                continue
+
+            try:
+                os.rmdir(dp)  # 비어있으면 OK
+                dirs_deleted += 1
+            except OSError:
+                # 잔여물이 있거나 권한 이슈: 강제 삭제 시도
+                try:
+                    shutil.rmtree(dp, ignore_errors=True)
+                    dirs_deleted += 1
+                except Exception as e:
+                    print(f"[경고] 폴더 삭제 실패: {dp} -> {e}")
+
+    if remove_root:
+        if dry_run:
+            print("[DRY-RUN] 루트 폴더 삭제:", apath)
+        else:
+            try:
+                os.rmdir(apath)
+            except OSError:
+                shutil.rmtree(apath, ignore_errors=True)
+
+    print(f"[정리완료] files: {files_deleted}, dirs: {dirs_deleted}, freed: {bytes_freed:,} bytes")
+    return files_deleted, dirs_deleted, bytes_freed
