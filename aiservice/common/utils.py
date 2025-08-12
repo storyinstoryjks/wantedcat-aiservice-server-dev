@@ -15,11 +15,12 @@ import random
 import itertools
 from pathlib import Path
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFile
 from urllib.parse import urljoin
 import requests
 from tqdm import tqdm
 import mimetypes
+from glob import glob
 
 
 def customer_upload_image_download_via_api(
@@ -350,6 +351,74 @@ def upload_datasets_via_api(api_base_url, x_api_key, container_name, blob_name, 
     return uploaded_files
 
 
+def upload_bestpt_via_api(api_base_url,
+                          x_api_key,
+                          result_dict,
+                          user_id,
+                          model_family="yolo2",
+                          container_name="best_model",
+                          timeout_sec=14400,
+                          overwrite=True):
+    """
+    result_dict['best_file_path']의 best.pt를
+    Azure Blob Storage: best_model/{model_family}/{user_id}/best.pt 로 업로드.
+
+    Returns: 1 (성공 시 업로드 파일 수), 실패 시 예외 발생
+    """
+    # 0) 로컬 best.pt 확인
+    local_best = result_dict.get("best_file_path")
+    if not local_best or not os.path.isfile(local_best):
+        raise FileNotFoundError(f"best_file_path가 없거나 파일이 아님: {local_best}")
+
+    # 1) 원격 blob 경로
+    blob_name = f"{model_family.rstrip('/')}/{user_id}/best.pt"
+
+    # 2) 엔드포인트 & 헤더
+    api_base = api_base_url.rstrip("/") + "/"
+    sas_url_endpoint = urljoin(api_base, "api/sas/generate")
+    headers_json = {"X-API-Key": x_api_key, "Content-Type": "application/json"}
+
+    # 3) MIME (pt는 일반적으로 octet-stream)
+    ctype, _ = mimetypes.guess_type(local_best)
+    if not ctype:
+        ctype = "application/octet-stream"
+
+    file_size = os.path.getsize(local_best)
+
+    with requests.Session() as s:
+        # 4) 쓰기 SAS URL 생성
+        payload = {
+            "fileName": blob_name,
+            "containerName": container_name,
+            "permission": "w",
+            "overwrite": bool(overwrite),
+        }
+        r = s.post(sas_url_endpoint, json=payload, headers=headers_json, timeout=timeout_sec)
+        r.raise_for_status()
+        sas_url = r.json().get("sasUrl")
+        if not sas_url:
+            raise RuntimeError(f"SAS URL 생성 실패: {container_name}/{blob_name}")
+
+        # 5) PUT 업로드 (BlockBlob), Content-Length 명시
+        put_headers = {
+            "x-ms-blob-type": "BlockBlob",
+            "Content-Type": ctype,
+            "Content-Length": str(file_size),
+        }
+
+        with open(local_best, "rb") as f, \
+             tqdm(total=file_size, unit="B", unit_scale=True, unit_divisor=1024,
+                  desc=f"uploading {os.path.basename(local_best)} → {container_name}/{blob_name}",
+                  leave=True) as pbar:
+            reader = TqdmFileReader(f, pbar)
+            resp = s.put(sas_url, data=reader, headers=put_headers, timeout=timeout_sec)
+            resp.raise_for_status()
+
+    print(f"[업로드완료] {local_best} -> {container_name}/{blob_name} ({file_size:,} bytes)")
+    print()
+    return 1
+
+
 
 def build_predict_dir(user_id: str,
                       base_dir: str = "/app/tmp/bbox_predict",
@@ -436,4 +505,25 @@ def purge_directory(path: str,
                 shutil.rmtree(apath, ignore_errors=True)
 
     print(f"[정리완료] files: {files_deleted}, dirs: {dirs_deleted}, freed: {bytes_freed:,} bytes")
+    print()
     return files_deleted, dirs_deleted, bytes_freed
+
+
+# ImageFile.LOAD_TRUNCATED_IMAGES = True  # 잘린 JPEG 복구에 도움
+
+def recovery_corrupt_jpeg(base_url, # /app
+                          img_dir): # tmp/datasets/your_user_id 
+    """데이터증강으로 인한 corrupt JPEG 복구 """
+
+    for type_ in ['train', 'valid']:
+        image_dir = os.path.join(base_url, img_dir, type_, 'images') # /app/tmp/datasets/your_user_id/train|valid/images
+        image_paths = glob(os.path.join(image_dir, "*.jpg"))
+
+        for img_path in tqdm(image_paths):
+            try:
+                with Image.open(img_path) as img:
+                    img = img.convert("RGB")  # RGB 보장
+                    img.save(img_path, "JPEG", quality=95, optimize=False) # optimize=True : 저장 용량 최적화 (단점: 메모리 사용 UP)
+                                                                           # False는 빠른 처리, True는 저장 용량 감소
+            except Exception as e:
+                print(f"[ERROR] {img_path} - {e}")

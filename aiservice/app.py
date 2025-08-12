@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import os, logging, datetime
 from common.utils import *
 from common.data_processing import *
+from common.learning import *
 from dotenv import load_dotenv
 
 
@@ -81,7 +82,7 @@ def prepare_yolo_model():
                                         timeout_sec=14400)
     print()
 
-    ### 3-2. [2-1번+2-2번] 학습데이터셋 구성 : 원본 + 데이터 증강 (로컬 누적) ### #(테스트 필요)
+    ### 3-2. [2-1번+2-2번] 학습데이터셋 구성 : 원본 + 데이터 증강 (로컬 누적) ###
     print("[2-1번+2-2번] YOLO모델(2번)을 위한 학습데이터셋 구성")
     print("="*100)
     # yaml_path, train_data_cnt, valid_data_cnt = config_train_datasets_v1(base_url=BASE_URL,
@@ -125,16 +126,56 @@ def prepare_yolo_model():
     # /app/tmp/bbox_predict/your_user_id/conf0.5_iou_0.7/predict
     target = os.path.join(BASE_URL, f"tmp/bbox_predict/{user_id}")
     purge_directory(target, safety_prefix=os.path.join(BASE_URL, "tmp/bbox_predict")) # 경로 직접 지정해서 비우기(폴더는 유지)
+    print()
 
-    ### 4. [2-4번] corrupt JPEG 복구 및 yolo모델(2번) 학습 ###
-    ### 5. [3번] YOLO모델(2번) 베스트 모델을 Azure Blob Storage에 저장 ###
+    ### 4. [2-4번] corrupt JPEG 복구 및 yolo모델(2번) 학습 ### (테스트 필요)
+    # corrupt JPEG 복구
+    print("[2-4번] corrupt JPEG 복구")
+    print("="*100)
+    recovery_corrupt_jpeg(base_url=BASE_URL, # /app
+                          img_dir=f"tmp/datasets/{user_id}") # tmp/datasets/your_user_id 
+    print()
+
+    # YOLO모델(2번) 학습 : Hybrid -> 실험 결과 Best HyperParameter로 바로 학습하도록 변경 (yolo11s, epoch=35, lr=0.00725) (테스트 필요)
+    print("[2-4번] YOLO모델(2번) 학습 시작")
+    print("="*100)
+    result = GridSearch_YOLO(epochs=[35],
+                             lr0s=[0.00725],
+                             models=['yolo11s'],
+                             base_dir=os.path.join(BASE_URL, 'tmp'), 
+                             dataset_name=f"datasets/{user_id}", 
+                             train_output_name=f'yolo2_train/{user_id}') 
+    print(f"학습결과")
+    print(result)
+    print()
+
+    ### 5. [3번] YOLO모델(2번) 베스트 모델을 Azure Blob Storage에 저장 ### (테스트 필요)
+    print("[3번] YOLO모델(2번) 베스트 모델을 Azure Blob Storage에 저장")
+    print("="*100)
+    uploaded_flag = upload_bestpt_via_api(api_base_url="http://collectionservice:8000",
+                                     x_api_key=X_API_KEY,
+                                     result_dict=result, 
+                                     user_id=user_id,  
+                                     model_family="yolo2",  
+                                     container_name="best_model",
+                                     timeout_sec=14400,
+                                     overwrite=True)
 
     ### [최종 폴더 정리] ###
     # /app/tmp/datasets/your_user_id
     target = os.path.join(BASE_URL, f"tmp/datasets/{user_id}")
     purge_directory(target, safety_prefix=os.path.join(BASE_URL, "tmp/datasets"))
 
-    return jsonify(status_code=200, message=f"{user_id} : 학습데이터셋 구성 및 YOLO모델(2번) 준비 완료")
+    # /app/tmp/yolo2_train/your_user_id/gridsearch
+    target = os.path.join(BASE_URL, f"tmp/yolo2_train/{user_id}")
+    purge_directory(target, safety_prefix=os.path.join(BASE_URL, "tmp/yolo2_train"))
+
+    return jsonify(
+        status_code=200, 
+        message=f"{user_id} : 학습데이터셋 구성 및 YOLO모델(2번) 준비 완료",
+        user_id=user_id,
+        result=result # 이 내용을 수집서버가 DB에 저장
+    )
 
 
 
