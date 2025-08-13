@@ -10,3 +10,12 @@ CREATE TABLE IF NOT EXISTS events (
     video_url VARCHAR(255)
 );
 
+CREATE TABLE IF NOT EXISTS aimodel (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id VARCHAR(255),
+    model_status VARCHAR(255),
+    model_name VARCHAR(255),
+    val_precision FLOAT,
+    val_recall FLOAT,
+    val_map50 FLOAT
+);

@@ -48,3 +48,22 @@ class StreamAuthRequest(BaseModel):
 # --- 재생 URL 응답용 스키마 ---
 class PlaybackResponse(BaseModel):
     playback_url: str
+
+
+# --- Aimodel 관련 스키마 ---
+class AimodelCreate(BaseModel):
+    user_id : str
+    model_status : str
+    model_name : str
+    val_precision : float
+    val_recall : float
+    val_map50 : float
+
+class AImodel(AimodelCreate):
+    id: int
+
+    class Config:
+        orm_mode = True
+
+class ModelRequest(BaseModel):
+    user_id: str

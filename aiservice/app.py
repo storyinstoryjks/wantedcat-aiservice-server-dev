@@ -152,7 +152,7 @@ def prepare_yolo_model():
     target = os.path.join(BASE_URL, f"tmp/origin/{user_id}")
     purge_directory(target, safety_prefix=os.path.join(BASE_URL, "tmp/origin"))
 
-    ### 4. [2-4번] corrupt JPEG 복구 및 yolo모델(2번) 학습 ### (테스트 필요)
+    ### 4. [2-4번] corrupt JPEG 복구 및 yolo모델(2번) 학습 ###
     # corrupt JPEG 복구
     print("[2-4번] corrupt JPEG 복구")
     print("="*100)
@@ -160,7 +160,7 @@ def prepare_yolo_model():
                           img_dir=f"tmp/datasets/{user_id}") # tmp/datasets/your_user_id 
     print()
 
-    # YOLO모델(2번) 학습 : Hybrid -> 실험 결과 Best HyperParameter로 바로 학습하도록 변경 (yolo11s, epoch=35, lr=0.00725) (테스트 필요)
+    # YOLO모델(2번) 학습 : Hybrid -> 실험 결과 Best HyperParameter로 바로 학습하도록 변경 (yolo11s, epoch=35, lr=0.00725)
     print("[2-4번] YOLO모델(2번) 학습 시작")
     print("="*100)
     path = download_blob_via_api(
@@ -174,7 +174,7 @@ def prepare_yolo_model():
     print("NanumSquareR.ttf 폰트 다운로드 완료:")
     print()
     
-    result = GridSearch_YOLO(epochs=[35],
+    result = GridSearch_YOLO(epochs=[1], # cpu 8코어 테스트용 (실전: 35)
                              lr0s=[0.00725],
                              models=['yolo11s'],
                              base_dir=os.path.join(BASE_URL, 'tmp'), 
@@ -184,7 +184,7 @@ def prepare_yolo_model():
     print(result)
     print()
 
-    ### 5. [3번] YOLO모델(2번) 베스트 모델을 Azure Blob Storage에 저장 ### (테스트 필요)
+    ### 5. [3번] YOLO모델(2번) 베스트 모델을 Azure Blob Storage에 저장 ###
     print("[3번] YOLO모델(2번) 베스트 모델을 Azure Blob Storage에 저장")
     print("="*100)
     uploaded_flag = upload_bestpt_via_api(api_base_url="http://collectionservice:8000",

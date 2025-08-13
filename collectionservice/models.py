@@ -18,3 +18,15 @@ class User(Base):
     hashed_password = Column(String(255))
     is_active = Column(Boolean, default=True)
     stream_key = Column(String(255), unique=True, index=True, nullable=True)
+
+
+# aimodel
+class Aimodel(Base):
+    __tablename__ = "aimodel"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(255)) 
+    model_status = Column(String(255))
+    model_name = Column(String(255))
+    val_precision = Column(Float)
+    val_recall = Column(Float)
+    val_map50 = Column(Float)

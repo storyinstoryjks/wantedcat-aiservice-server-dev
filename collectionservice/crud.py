@@ -45,3 +45,17 @@ def generate_and_set_stream_key(db: Session, user_id: int):
 def get_user_by_stream_key(db: Session, stream_key: str):
     """(기능 3) 스트림 키로 사용자를 조회"""
     return db.query(models.User).filter(models.User.stream_key == stream_key).first()
+
+
+############################################ AI 관련 ################################################
+def create_aimodel(db: Session, ai: schemas.AimodelCreate):
+    db_aimodel = models.Aimodel(**ai.dict())
+
+    db.add(db_aimodel)
+    db.commit()
+    db.refresh(db_aimodel)
+
+    return db_aimodel
+
+
+#####################################################################################################
