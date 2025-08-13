@@ -4,20 +4,35 @@ from common.utils import *
 from common.data_processing import *
 from common.learning import *
 from dotenv import load_dotenv
+from ultralytics import YOLO
+from threading import Lock
 
 
 # --- 전역 설정(앱, 경로, ...) ---
 load_dotenv()
+_model_lock = Lock()
+
+def ensure_yolo0_loaded():
+    global YOLO0_BEST_MODEL
+    if YOLO0_BEST_MODEL is None:
+        with _model_lock:
+            if YOLO0_BEST_MODEL is None:
+                path = download_blob_via_api(
+                    api_base_url="http://collectionservice:8000",
+                    x_api_key=X_API_KEY,
+                    container_name="bestmodel",
+                    blob_path="yolo0/best.pt",
+                    download_dir=os.path.join(BASE_URL, "best_model/yolo0"),
+                    timeout_sec=14400
+                )
+                YOLO0_BEST_MODEL = YOLO(path)
+                print("YOLO0 준비 완료")
 
 app = Flask(__name__)
 BASE_URL = app.root_path
 X_API_KEY = os.getenv("X_API_KEY")
-YOLO0_BEST_MODEL = YOLO(os.path.join(BASE_URL, 'best_model/yolo0/best.pt')) # blob storage에서 다운받는거 추가해야함
+YOLO0_BEST_MODEL = None
 
-@app.route('/hello', methods=['GET'])
-def hello():
-    print("[INFO 테스트] /hello")
-    return "OK", 200
 
 # --- API 엔드포인트 정의 ---
 @app.route('/api/aiservice/prepare/upload', methods=['POST'])
@@ -25,6 +40,7 @@ def prepare_upload_image():
     """
     사용자 업로드 이미지 로컬에 저장
     """
+
     ### 1. (React->수집서버)에서 고양이 프로필 정보 받기 ###
     data = request.get_json()
     cat_name=data.get('cat_name') # 단일 고양이 이름
@@ -41,7 +57,7 @@ def prepare_upload_image():
                                            timeout_sec=14400 )# Blob storage에서 다운로드 받아, 해당 폴더에 저장
     
     ### 3. 수집서버에게 리턴 ###
-    return jsonify(status_code=200, message=f"{user_id} : ['{cat_name}'고양이] 사용자 업로드 이미지 저장 완료. (최종 x)")
+    return jsonify(status_code=200, message=f"{user_id} : ['{cat_name}'고양이] 사용자 업로드 이미지 저장 완료. (최종 x)"),200
 
 
 @app.route('/api/aiservice/prepare/model', methods=['POST'])
@@ -56,6 +72,10 @@ def prepare_yolo_model():
     # cat_name=data.get('cat_name')
     user_id=data.get('user_id')
 
+    # YOLO(0번) 모델 준비
+    ensure_yolo0_loaded()
+    if YOLO0_BEST_MODEL==None:
+        return jsonify(status_code=500, message="YOLO0모델의 best.pt가 로컬에 없음. Blob Storage에서 다운로드 필요."),500
 
 
     ### 2. [1번/2-1번] 사용자 업로드 이미지 bbox 예측 ###
@@ -128,6 +148,10 @@ def prepare_yolo_model():
     purge_directory(target, safety_prefix=os.path.join(BASE_URL, "tmp/bbox_predict")) # 경로 직접 지정해서 비우기(폴더는 유지)
     print()
 
+    # /app/tmp/origin/your_user_id
+    target = os.path.join(BASE_URL, f"tmp/origin/{user_id}")
+    purge_directory(target, safety_prefix=os.path.join(BASE_URL, "tmp/origin"))
+
     ### 4. [2-4번] corrupt JPEG 복구 및 yolo모델(2번) 학습 ### (테스트 필요)
     # corrupt JPEG 복구
     print("[2-4번] corrupt JPEG 복구")
@@ -139,6 +163,17 @@ def prepare_yolo_model():
     # YOLO모델(2번) 학습 : Hybrid -> 실험 결과 Best HyperParameter로 바로 학습하도록 변경 (yolo11s, epoch=35, lr=0.00725) (테스트 필요)
     print("[2-4번] YOLO모델(2번) 학습 시작")
     print("="*100)
+    path = download_blob_via_api(
+                    api_base_url="http://collectionservice:8000",
+                    x_api_key=X_API_KEY,
+                    container_name="font",
+                    blob_path="NanumSquareR.ttf",
+                    download_dir=os.path.join(BASE_URL, "font"),
+                    timeout_sec=14400
+                )
+    print("NanumSquareR.ttf 폰트 다운로드 완료:")
+    print()
+    
     result = GridSearch_YOLO(epochs=[35],
                              lr0s=[0.00725],
                              models=['yolo11s'],
@@ -157,7 +192,7 @@ def prepare_yolo_model():
                                      result_dict=result, 
                                      user_id=user_id,  
                                      model_family="yolo2",  
-                                     container_name="best_model",
+                                     container_name="bestmodel",
                                      timeout_sec=14400,
                                      overwrite=True)
 
@@ -170,12 +205,13 @@ def prepare_yolo_model():
     target = os.path.join(BASE_URL, f"tmp/yolo2_train/{user_id}")
     purge_directory(target, safety_prefix=os.path.join(BASE_URL, "tmp/yolo2_train"))
 
+
     return jsonify(
         status_code=200, 
         message=f"{user_id} : 학습데이터셋 구성 및 YOLO모델(2번) 준비 완료",
         user_id=user_id,
         result=result # 이 내용을 수집서버가 DB에 저장
-    )
+    ),200
 
 
 

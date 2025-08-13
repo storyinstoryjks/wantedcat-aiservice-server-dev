@@ -7,9 +7,14 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # (중요) OpenCV 런타임 의존성 설치: libGL 등
+# RUN apt-get update && \
+#     apt-get install -y --no-install-recommends \
+#         libgl1-mesa-glx \
+#         libglib2.0-0 && \
+#     rm -rf /var/lib/apt/lists/*
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        libgl1-mesa-glx \
+        libgl1 \
         libglib2.0-0 && \
     rm -rf /var/lib/apt/lists/*
 

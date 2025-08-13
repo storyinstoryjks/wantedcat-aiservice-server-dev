@@ -12,6 +12,7 @@ import albumentations as A
 from collections import Counter, defaultdict
 import random
 import itertools
+from common.utils import use_korean_font
 
 
 def GridSearch_YOLO(epochs,
@@ -20,6 +21,9 @@ def GridSearch_YOLO(epochs,
                     base_dir, # /app/tmp
                     dataset_name, # datasets/your_user_id
                     train_output_name): # yolo2_train/your_user_id
+
+    # 한글 폰트 사용 설정 (한 번만 호출해도 충분하지만, 안전하게 매 진입 시 보장)
+    use_korean_font("/app/font/NanumSquareR.ttf")
 
     data_path = os.path.join(base_dir, dataset_name, 'data.yaml') # /app/tmp/datasets/your_user_id/data.yaml
     base_project = os.path.join(base_dir, train_output_name, 'gridsearch') # /app/tmp/yolo2_train/your_user_id/gridsearch

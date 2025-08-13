@@ -4,10 +4,12 @@ import os, json, shutil, itertools, csv
 import time
 from azure.storage.blob import BlobServiceClient
 import cv2
+import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 import optuna
 import albumentations as A
 from collections import Counter, defaultdict
@@ -21,6 +23,77 @@ import requests
 from tqdm import tqdm
 import mimetypes
 from glob import glob
+
+
+def use_korean_font(ttf_path: str = "/app/font/NanumSquareR.ttf"):
+    """
+    주어진 TTF를 Matplotlib 기본 폰트로 등록/사용한다.
+    - 한글 글리프 경고 제거
+    - 음수 기호 깨짐 방지(axes.unicode_minus=False)
+    """
+    if not os.path.isfile(ttf_path):
+        print(f"[FONT][WARN] Not found: {ttf_path}")
+        return
+
+    try:
+        # 폰트 등록
+        fm.fontManager.addfont(ttf_path)
+        # 내부 폰트 패밀리명 추출 (예: 'NanumSquare')
+        font_name = fm.FontProperties(fname=ttf_path).get_name()
+
+        # 전역 기본 폰트 설정
+        plt.rcParams["font.family"] = font_name
+        plt.rcParams["axes.unicode_minus"] = False  # 마이너스 기호 깨짐 방지
+
+        print(f"[FONT][OK] Using font '{font_name}' from {ttf_path}")
+    except Exception as e:
+        print(f"[FONT][ERR] Failed to load {ttf_path}: {e}")
+
+
+def download_blob_via_api(api_base_url: str,
+                          x_api_key: str,
+                          container_name: str,
+                          blob_path: str,           # 예: "yolo0/best.pt"
+                          download_dir: str,        # 예: "/app/best_model/yolo0"
+                          timeout_sec: int = 14400) -> str:
+    """
+    Azure Blob Storage의 {container_name}/{blob_path}를 download_dir로 다운로드한다.
+    반환값: 로컬 저장 경로
+    """
+    os.makedirs(download_dir, exist_ok=True)
+
+    # 엔드포인트
+    api_base = api_base_url.rstrip("/") + "/"
+    sas_url_endpoint = urljoin(api_base, "api/sas/generate")
+    headers_json = {"X-API-Key": x_api_key, "Content-Type": "application/json"}
+
+    with requests.Session() as s:
+        # 1) 파일별 SAS URL 생성
+        payload = {"fileName": blob_path, "containerName": container_name, "permission": "r"}
+        r = s.post(sas_url_endpoint, json=payload, headers=headers_json, timeout=timeout_sec)
+        r.raise_for_status()
+        sas_url = r.json().get("sasUrl")
+        if not sas_url:
+            raise RuntimeError(f"SAS URL 생성 실패: {container_name}/{blob_path}")
+
+        # 2) 다운로드 (스트리밍)
+        with s.get(sas_url, stream=True, timeout=timeout_sec) as dl:
+            dl.raise_for_status()
+            total_size = int(dl.headers.get("Content-Length", 0))
+            chunk_size = 1024 * 1024  # 1MB
+
+            local_path = os.path.join(download_dir, os.path.basename(blob_path))
+            with tqdm(total=total_size if total_size > 0 else None,
+                      unit="B", unit_scale=True, unit_divisor=1024,
+                      desc=os.path.basename(blob_path), leave=True) as pbar, \
+                 open(local_path, "wb") as f:
+                for chunk in dl.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+
+    print(f"[저장완료] {container_name}/{blob_path} -> {local_path}")
+    return local_path
 
 
 def customer_upload_image_download_via_api(
@@ -367,6 +440,7 @@ def upload_bestpt_via_api(api_base_url,
     """
     # 0) 로컬 best.pt 확인
     local_best = result_dict.get("best_file_path")
+    print(local_best)
     if not local_best or not os.path.isfile(local_best):
         raise FileNotFoundError(f"best_file_path가 없거나 파일이 아님: {local_best}")
 
