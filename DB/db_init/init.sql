@@ -7,7 +7,10 @@ CREATE TABLE IF NOT EXISTS events (
     event_time DATETIME,
     duration_seconds FLOAT,
     weight_info VARCHAR(255),
-    video_url VARCHAR(255)
+    origin_video_url VARCHAR(255),
+    bbox_video_url VARCHAR(255),
+    event_type VARCHAR(255),
+    cat_name VARCHAR(255)
 );
 
 CREATE TABLE IF NOT EXISTS aimodel (

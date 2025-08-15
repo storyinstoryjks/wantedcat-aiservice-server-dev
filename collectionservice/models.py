@@ -9,7 +9,10 @@ class Event(Base): #Pydantic 모델 구
     event_time = Column(DateTime)
     duration_seconds = Column(Float)
     weight_info = Column(String(255))
-    video_url = Column(String(255))
+    origin_video_url = Column(String(255))
+    bbox_video_url = Column(String(255))
+    event_type = Column(String(255))
+    cat_name = Column(String(255))
 
 class User(Base):
     __tablename__ = "users"

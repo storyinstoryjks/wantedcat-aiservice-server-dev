@@ -69,6 +69,9 @@ async def list_blobs(container: str, prefix: str, _: str = Depends(get_api_key))
 
 @app.post("/api/model", dependencies=[Depends(get_api_key)])
 async def prepare_user_yolo_model(req: schemas.ModelRequest, db: Session = Depends(get_db)):
+    """
+    고객별 YOLO모델(2번) 준비 컨트롤러
+    """
     user_id = req.user_id
 
     # Flask 서버(aiservice 컨테이너)로 POST 요청
@@ -98,6 +101,49 @@ async def prepare_user_yolo_model(req: schemas.ModelRequest, db: Session = Depen
         raise HTTPException(status_code=502, detail=f"aiservice의 prepare_yolo_model() 호출 실패: {e}") from e
     
     return {"status":"success", "message":"YOLO모델이 준비되었습니다."}
+
+
+@app.post("/api/events/bbox/video", dependencies=[Depends(get_api_key)])
+async def receive_event_for_bbox_video(event: schemas.EventRequest, db: Session = Depends(get_db)):
+    """
+    BBOX 영상 제작 컨트롤러
+    1. 라즈베리파이(실시간 요청)로부터 이벤트 정보 받기(video_url=특정고양이가식사하는crop된영상주소 by Azure Blob Storage)
+    2. AI서버에게 요청 : BBOX 제작
+    3. AI서버로부터 BBOX 영상 blob주소 + 고양이라벨 정보를 받음
+    4. db의 event 테이블에 레코드 삽입
+    """
+    
+    user_id = event.user_id
+    origin_video_url = event.origin_video_url
+
+    # Flask 서버(aiservice 컨테이너)로 POST 요청
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(18000.0)) as client:
+            resp = await client.post(
+                "http://aiservice:8001/api/aiservice/upload/bbox",
+                json={"user_id": user_id, "origin_video_url": origin_video_url}, # 바디
+                headers={"Content-Type": "application/json"} # 헤더
+            )
+            resp.raise_for_status()
+            data = resp.json()  # {"cat_name": str, "bbox_video_url": str}
+
+            # event_schemas = schemas.EventCreate(
+            #     user_id = user_id,
+            #     event_time = event.event_time,
+            #     duration_seconds = event.duration_seconds,
+            #     weight_info = event.weight_info,
+            #     origin_video_url = origin_video_url,
+            #     bbox_video_url = data['bbox_video_url'],
+            #     event_type = event.event_type,
+            #     cat_name = data['cat_name']
+            # )
+            # created_evnet = crud.create_event(db=db, event=event_schemas)
+            # print("DB에 성공적으로 저장:", created_event.__dict__)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"aiservice의 make_and_upload_bbox_video() 호출 실패: {e}") from e
+    
+
+    return {"status":"success", "message":"BBOX 영상 완료"}
 
 #####################################################################################################
 

@@ -28,10 +28,27 @@ def ensure_yolo0_loaded():
                 YOLO0_BEST_MODEL = YOLO(path)
                 print("YOLO0 준비 완료")
 
+def ensure_yolo2_loaded(userid):
+    global YOLO2_BEST_MODEL
+    if YOLO2_BEST_MODEL is None:
+        with _model_lock:
+            if YOLO2_BEST_MODEL is None:
+                path = download_blob_via_api(
+                    api_base_url="http://collectionservice:8000",
+                    x_api_key=X_API_KEY,
+                    container_name="bestmodel",
+                    blob_path=f"yolo2/{userid}/best.pt",
+                    download_dir=os.path.join(BASE_URL, f"best_model/yolo2/{userid}"),
+                    timeout_sec=14400
+                )
+                YOLO2_BEST_MODEL = YOLO(path)
+                print(f"{userid}의 YOLO2 준비 완료")
+
 app = Flask(__name__)
 BASE_URL = app.root_path
 X_API_KEY = os.getenv("X_API_KEY")
 YOLO0_BEST_MODEL = None
+YOLO2_BEST_MODEL = None
 
 
 # --- API 엔드포인트 정의 ---
@@ -221,21 +238,89 @@ def make_and_upload_bbox_video():
     실제 환경 플로우 : 홈캠 영상 -> bbox 영상 만들기
     """
     # 1. 수집서버에서 특정 고양이의 식사 이벤트 정보를 넘겨받는다.
+    print("[1번] 수집서버로부터 특정 고양이의 식사 이벤트 정보 받기")
+    print("="*100)
     data = request.get_json()
-
     user_id = data.get('user_id')
-    video_url = data.get('video_url')
-    event_time = datetime.datetime.fromisoformat(data.get('event_time'))
-    weight_info = data.get('weight_info')
-    duration_seconds = data.get('duration_seconds')
+    origin_video_url = data.get('origin_video_url')
+    print(f"user_id: {user_id}")
+    print(f"origin_video_url: {origin_video_url}")
+    print()
 
-    print(f"User ID: {user_id}")
-    print(f"Video URL: {video_url}")
-    print(f"Event Time: {event_time}")
-    print(f"Weight Info: {weight_info}")
-    print(f"Duration (seconds): {duration_seconds}")
+    # 2-1. YOLO(0번) 모델 준비
+    print("[2-1번] YOLO0 다운")
+    print("="*100)
+    ensure_yolo0_loaded()
+    if YOLO0_BEST_MODEL==None:
+        return jsonify(status_code=500, message="YOLO0모델의 best.pt가 로컬에 없음. Blob Storage에서 다운로드 필요."),500
+    print()
+    
+    # 2-2. YOLO(2번) 모델 준비
+    print("[2-2번] YOLO2 다운")
+    print("="*100)
+    ensure_yolo2_loaded(user_id)
+    if YOLO2_BEST_MODEL==None:
+        return jsonify(status_code=500, message=f"{user_id}의 YOLO2모델 best.pt가 로컬에 없음. Blob Storage에서 다운로드 필요."),500
+    print()
 
-    return "OK",200
+    # 3. Crop된 동영상 다운로드
+    print("[3번] 식사/음수량 이벤트 원본 동영상 다운로드")
+    print("="*100)
+    origin_video_local_path = download_video_by_url(api_base_url="http://collectionservice:8000",
+                                       x_api_key=X_API_KEY,
+                                       video_url=origin_video_url,
+                                       download_root=os.path.join(BASE_URL, 'videos', 'origin'),  
+                                       subdir=f"{user_id}",         
+                                       timeout_sec=14400)
+    print(f"origin_video_local_path: {origin_video_local_path}")
+    print()
+
+    # 4. 원본 동영상 프레임별 이미지 추출
+    print("[4번] 원본 동영상 프레임별 이미지 추출")
+    print("="*100)
+    videos_extractor(output_dir=os.path.join(BASE_URL,f"frames/origin/{user_id}"),
+                     video_path=origin_video_local_path)
+    print()
+
+    # 5. YOLO0으로 프레임별 이미지 bbox 예측
+    print("[5번] YOLO0으로 프레임별 이미지 bbox 예측")
+    print("="*100)
+    name_and_bbox = bbox_predict_and_points(model=YOLO0_BEST_MODEL,
+                                            base_dir=os.path.join(BASE_URL, 'frames'), 
+                                            img_dir=f"origin/{user_id}", 
+                                            project_name=f"predict_frames_all_yolo0/{user_id}",
+                                            conf=0.5,
+                                            iou=0.7)
+    print(f"name_and_bbox 구성 확인하기")
+    print(name_and_bbox[0])
+    print()
+
+    # 6. 예측된 각 이미지의 bbox 영역 Crop하기
+    print("[6번] 예측된 각 이미지의 bbox 영역 Crop하기")
+    print("="*100)
+    cropped_images = []
+    for e in name_and_bbox:
+        cropped_image = crop_bboxes_and_save(origin_img_path=e['origin_img_path'], 
+                                             bbox_list=e['xyxy'], 
+                                             save_dir=os.path.join(BASE_URL, f'frames/cropped_bboxed_all/{user_id}'))
+        cropped_images.append(cropped_image)
+    print(cropped_images[0])
+    print()
+
+    # 7. 화질 개선
+    print("[7번] crop 이미지들 화질 개선")
+    print("="*100)
+    enhance_all_images_v1(input_dir=os.path.join(BASE_URL, f'frames/cropped_bboxed_all/{user_id}'),
+                          output_dir=os.path.join(BASE_URL, f"frames/enhanced_v1_cropped_bboxes_all/{user_id}"))
+    print("화질 개선 완료")
+
+    # 8. YOLO2로 라벨 예측
+
+
+    return jsonify(
+        cat_name="cat_name",
+        bbox_video_url="bbox_video_url"
+    ),200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8001)

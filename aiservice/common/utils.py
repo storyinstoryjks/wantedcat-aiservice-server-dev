@@ -18,7 +18,7 @@ import itertools
 from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFile
-from urllib.parse import urljoin
+from urllib.parse import urlparse, urljoin, unquote
 import requests
 from tqdm import tqdm
 import mimetypes
@@ -94,6 +94,82 @@ def download_blob_via_api(api_base_url: str,
 
     print(f"[저장완료] {container_name}/{blob_path} -> {local_path}")
     return local_path
+
+
+import os
+import requests
+from urllib.parse import urlparse, urljoin, unquote
+from tqdm import tqdm
+
+def download_video_by_url(api_base_url: str, # http://collectionservice:8000
+                          x_api_key: str, 
+                          video_url: str,
+                          download_root: str = "/app/videos",
+                          subdir: str | None = None,
+                          timeout_sec: int = 14400) -> str:
+    """
+    전체 Blob URL(예: https://<account>.blob.core.windows.net/<container>/<blob_path>)
+    을 받아, SAS 생성 API로 읽기 권한 URL을 발급받아 로컬에 스트리밍 다운로드
+    """
+    # 1) URL 파싱하여 container / blob_path 추출
+    parsed = urlparse(video_url)
+    # path 예: "/video/your_user_id_af556a...a2c.mp4" 또는 "/video/folder/a.mp4"
+    # split 후 첫 요소는 빈 문자열이므로 제외
+    path_parts = [p for p in parsed.path.split('/') if p]
+    if len(path_parts) < 2:
+        raise ValueError(f"URL에서 container/blob_path를 파싱하지 못했습니다: {video_url}")
+
+    container_name = path_parts[0]
+    blob_path = "/".join(path_parts[1:])
+    # URL 인코딩된 경로 복원
+    blob_path = unquote(blob_path)
+    file_name = os.path.basename(blob_path)
+
+    # 2) 저장 디렉터리 결정
+    # subdir 미지정 시: 파일명에서 첫 '_' 앞부분을 폴더명으로 사용 (예: your_user_id_abc.mp4 -> your_user_id)
+    if subdir is None:
+        if "_" in file_name:
+            subdir = file_name.split("_", 1)[0]
+        else:
+            # '_'가 없으면 확장자 없는 파일명 사용
+            subdir = os.path.splitext(file_name)[0]
+
+    download_dir = os.path.join(download_root, subdir)
+    os.makedirs(download_dir, exist_ok=True)
+
+    # 3) SAS 생성 엔드포인트 구성
+    api_base = api_base_url.rstrip("/") + "/"
+    sas_url_endpoint = urljoin(api_base, "api/sas/generate")
+    headers_json = {"X-API-Key": x_api_key, "Content-Type": "application/json"}
+
+    with requests.Session() as s:
+        # 원래 URL에 이미 SAS 쿼리가 있더라도, 보안/통일성을 위해 API로 새로 발급
+        payload = {"fileName": blob_path, "containerName": container_name, "permission": "r"}
+        r = s.post(sas_url_endpoint, json=payload, headers=headers_json, timeout=timeout_sec)
+        r.raise_for_status()
+        sas_url = r.json().get("sasUrl")
+        if not sas_url:
+            raise RuntimeError(f"SAS URL 생성 실패: {container_name}/{blob_path}")
+
+        # 4) 스트리밍 다운로드
+        with s.get(sas_url, stream=True, timeout=timeout_sec) as dl:
+            dl.raise_for_status()
+            total_size = int(dl.headers.get("Content-Length", 0))
+            chunk_size = 1024 * 1024  # 1MB
+
+            local_path = os.path.join(download_dir, file_name)
+            with tqdm(total=total_size if total_size > 0 else None,
+                      unit="B", unit_scale=True, unit_divisor=1024,
+                      desc=file_name, leave=True) as pbar, \
+                 open(local_path, "wb") as f:
+                for chunk in dl.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+
+    print(f"[저장완료] {container_name}/{blob_path} -> {local_path}")
+    return local_path
+
 
 
 def customer_upload_image_download_via_api(
@@ -193,7 +269,8 @@ def bbox_predict_and_points(model, # best.pt (yolo(0)모델)
                                 name="",
                                 exist_ok=True,
                                 conf=conf,
-                                iou=iou)
+                                iou=iou,
+                                verbose=False)
         results.append(result[0])
         origin_img_paths.append(img_source)
         class_names.append(file.split('_')[0])
@@ -601,3 +678,81 @@ def recovery_corrupt_jpeg(base_url, # /app
                                                                            # False는 빠른 처리, True는 저장 용량 감소
             except Exception as e:
                 print(f"[ERROR] {img_path} - {e}")
+
+
+
+def videos_extractor(output_dir, # /app/frames/origin/your_user_id
+                     video_path): # /app/videos/origin/your_user_id/stream_2025-07-29_19-03.mp4
+    """
+    동영상 프레임별 이미지 추출
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    cap = cv2.VideoCapture(video_path)
+
+    frame_count = 0
+    success = True
+
+    while success:
+        success, frame = cap.read()
+        if success:
+            frame_filename = os.path.join(output_dir, f'frame_{frame_count:05d}.jpg')
+            cv2.imwrite(frame_filename, frame)
+            frame_count += 1
+
+    cap.release()
+
+    print(f"총 {frame_count}개의 프레임이 저장")
+
+
+def crop_bboxes_and_save(origin_img_path, bbox_list, save_dir):
+    """
+    한 장 이미지에 그려진 bbox 좌표별로 crop해 로컬에 저장
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    img = cv2.imread(origin_img_path)
+
+    frame_name = os.path.splitext(os.path.basename(origin_img_path))[0]
+
+    cropped_paths = []
+    for idx, (x1, y1, x2, y2) in enumerate(bbox_list):
+        crop = img[int(y1):int(y2), int(x1):int(x2)]
+        crop_path = os.path.join(save_dir, f'{frame_name}_crop_{idx:02d}.jpg')
+        cv2.imwrite(crop_path, crop)
+        cropped_paths.append(crop_path)
+
+    return cropped_paths
+
+
+# 화질개선 : 샤프닝 기법 v1
+def enhance_image_opencv_v1(image_path, output_path):
+    """
+    enhance_all_images_v1에서 사용
+    """
+    img = cv2.imread(image_path)
+
+    # 샤프닝 필터 적용
+    sharpening_kernel = np.array([[0, -1, 0],
+                                  [-1, 5, -1],
+                                  [0, -1, 0]])
+    sharpened = cv2.filter2D(img, -1, sharpening_kernel)
+
+    # 히스토그램 평활화 (대비 향상) - YUV 공간
+    yuv = cv2.cvtColor(sharpened, cv2.COLOR_BGR2YUV)
+    yuv[:, :, 0] = cv2.equalizeHist(yuv[:, :, 0])
+    enhanced = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+
+    # 저장
+    cv2.imwrite(output_path, enhanced)
+
+def enhance_all_images_v1(input_dir, output_dir):
+    """
+    화질개선 : 샤프닝 기법 v1
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    for fname in os.listdir(input_dir):
+        if fname.lower().endswith(('.jpg', '.png', '.jpeg')):
+            in_path = os.path.join(input_dir, fname)
+            out_path = os.path.join(output_dir, fname)
+            enhance_image_opencv_v1(in_path, out_path)

@@ -10,12 +10,23 @@ class SasResponse(BaseModel):
     sasUrl: str
     blobUrl: str
 
+class EventRequest(BaseModel):
+    user_id: str
+    event_time: datetime
+    duration_seconds: float
+    weight_info: str
+    origin_video_url: str
+    event_type: str
+
 class EventCreate(BaseModel):
     user_id: str
     event_time: datetime
     duration_seconds: float
     weight_info: str
-    video_url: str
+    origin_video_url: str
+    bbox_video_url: str
+    event_type: str
+    cat_name: str
 
 class Event(EventCreate):
     id: int
