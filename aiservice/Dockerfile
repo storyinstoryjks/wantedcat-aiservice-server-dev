@@ -15,7 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libgl1 \
-        libglib2.0-0 && \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 # YOLO 설정 디렉토리 생성 및 권한 부여

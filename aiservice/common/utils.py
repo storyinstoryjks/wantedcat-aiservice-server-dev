@@ -23,7 +23,8 @@ import requests
 from tqdm import tqdm
 import mimetypes
 from glob import glob
-
+import re
+import subprocess
 
 def use_korean_font(ttf_path: str = "/app/font/NanumSquareR.ttf"):
     """
@@ -270,7 +271,7 @@ def bbox_predict_and_points(model, # best.pt (yolo(0)모델)
                                 exist_ok=True,
                                 conf=conf,
                                 iou=iou,
-                                verbose=False)
+                                verbose=True)
         results.append(result[0])
         origin_img_paths.append(img_source)
         class_names.append(file.split('_')[0])
@@ -570,6 +571,71 @@ def upload_bestpt_via_api(api_base_url,
     return 1
 
 
+def upload_bbox_video_via_api(api_base_url,
+                              x_api_key,
+                              user_id,
+                              idx=1,
+                              base_dir="/app/videos/reconstructed",
+                              container_name="history",
+                              timeout_sec=14400,
+                              overwrite=True):
+    """
+    로컬 mp4: {base_dir}/{user_id}/bbox_video_{idx}.mp4
+      → Azure Blob: {container_name}/{user_id}/bbox_video_{idx}.mp4 로 업로드.
+
+    Return: 업로드된 Blob의 URL (예: https://wantedcat.blob.core.windows.net/history/your_user_id/bbox_video_1.mp4)
+    """
+    # 0) 로컬 파일 확인
+    local_mp4 = os.path.join(base_dir.rstrip("/"), user_id, f"bbox_video_{idx}.mp4")
+    if not os.path.isfile(local_mp4):
+        raise FileNotFoundError(f"로컬 mp4가 없거나 파일이 아님: {local_mp4}")
+
+    # 1) 원격 blob 경로
+    blob_name = f"{user_id}/bbox_video_{idx}.mp4"
+
+    # 2) SAS 발급 엔드포인트 & 헤더
+    api_base = api_base_url.rstrip("/") + "/"
+    sas_url_endpoint = urljoin(api_base, "api/sas/generate")
+    headers_json = {"X-API-Key": x_api_key, "Content-Type": "application/json"}
+
+    # 3) MIME / 크기
+    ctype, _ = mimetypes.guess_type(local_mp4)
+    if not ctype:
+        ctype = "video/mp4"
+    file_size = os.path.getsize(local_mp4)
+
+    with requests.Session() as s:
+        # 4) 쓰기 권한 SAS URL 생성
+        payload = {
+            "fileName": blob_name,
+            "containerName": container_name,
+            "permission": "w",
+            "overwrite": bool(overwrite),
+        }
+        r = s.post(sas_url_endpoint, json=payload, headers=headers_json, timeout=timeout_sec)
+        r.raise_for_status()
+        sas_url = r.json().get("sasUrl")
+        if not sas_url:
+            raise RuntimeError(f"SAS URL 생성 실패: {container_name}/{blob_name}")
+
+        # 5) PUT 업로드 (BlockBlob) - Content-Length 고정
+        put_headers = {
+            "x-ms-blob-type": "BlockBlob",
+            "Content-Type": ctype,
+            "Content-Length": str(file_size),
+        }
+
+        with open(local_mp4, "rb") as f, \
+             tqdm(total=file_size, unit="B", unit_scale=True, unit_divisor=1024,
+                  desc=f"uploading {os.path.basename(local_mp4)} → {container_name}/{blob_name}",
+                  leave=True) as pbar:
+            reader = TqdmFileReader(f, pbar)
+            resp = s.put(sas_url, data=reader, headers=put_headers, timeout=timeout_sec)
+            resp.raise_for_status()
+
+    # 6) SAS 쿼리 제거한 기본 Blob URL 반환
+    return sas_url.split("?", 1)[0]
+
 
 def build_predict_dir(user_id: str,
                       base_dir: str = "/app/tmp/bbox_predict",
@@ -756,3 +822,367 @@ def enhance_all_images_v1(input_dir, output_dir):
             in_path = os.path.join(input_dir, fname)
             out_path = os.path.join(output_dir, fname)
             enhance_image_opencv_v1(in_path, out_path)
+
+
+def classify_crops_with_yolo2(crop_dir, project_name, enhance_version, yolo_model):
+    """
+    YOLO2로 고양이 라벨 예측
+    """
+    return_results = []
+    for file in os.listdir(crop_dir):
+        crop_img_path = os.path.join(crop_dir, file)
+        results = yolo_model.predict(source=crop_img_path, 
+                                     conf=0.5, 
+                                     iou=0.7, 
+                                     save=True,
+                                     project=project_name,
+                                     name=enhance_version, # /app/frames/project_name/enhance_version/predict
+                                     exist_ok=True,
+                                     verbose=True)
+        if len(results) > 0 and len(results[0].boxes.cls) > 0: # 어처피 고양이 단일로 crop한거이기 때문에 0 또는 1임. (results[0].boxes.cls)
+            class_id = int(results[0].boxes.cls[0])
+            class_name = results[0].names[class_id]
+            confidence = round(float(results[0].boxes.conf[0]), 2)
+        else:
+            class_name = 'unknown'
+            confidence = 0.0
+        return_results.append({
+            'file_name' : file,
+            'class' : class_name,
+            'conf' : confidence
+        })
+    return return_results
+
+
+
+def draw_class_labels_with_conf(origin_img_path, bbox_list, label_list, output_img_path, font_base_path):
+    """
+    bbox에 클래스 이름을 써서 원본 이미지에 그리기
+    => visualize_one_frame()에서 사용
+    """
+    # OpenCV로 이미지 로드 → RGB 변환 → PIL 이미지로 변환
+    img_cv = cv2.imread(origin_img_path)
+    img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB) #
+    img_pil = Image.fromarray(img_rgb) #
+    draw = ImageDraw.Draw(img_pil) #
+
+    # 한글 폰트 경로 (NanumGothic 설치되어 있어야 함)
+    font_path = os.path.join(font_base_path, "NanumSquareR.ttf")
+    font = ImageFont.truetype(font_path, 32)
+
+    # bbox 및 라벨 + confidence 표시
+    for (x1, y1, x2, y2), label in zip(bbox_list, label_list):
+        pt1 = (int(x1), int(y1))
+        pt2 = (int(x2), int(y2))
+        draw.rectangle([pt1, pt2], outline=(0, 0, 255), width=3)  # 진한 파란색 bbox
+        draw.text((pt1[0], pt1[1] - 35), label, font=font, fill=(255, 0, 0))  # 빨간색 글자
+
+    # PIL → OpenCV BGR 변환 후 저장
+    img_final = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    os.makedirs(os.path.dirname(output_img_path), exist_ok=True)
+    cv2.imwrite(output_img_path, img_final)
+
+
+def visualize_one_frame(frame_id, enhanced_bbox_results, name_and_bbox, save_dir, font_base_path):
+    """
+    bbox에 클래스 이름을 써서 원본 이미지에 그리기
+    => visualize_all_frames()에서 사용
+    """
+    # 1. frame_id로부터 관련 결과 추출
+    target_filename_prefix = f"frame_{frame_id:05d}_crop_"
+
+    # 해당 frame에 대한 예측 정보만 필터링
+    results_for_frame = [r for r in enhanced_bbox_results if r["file_name"].startswith(target_filename_prefix)]
+
+    # 2. name_and_bbox에서 해당 프레임에 대한 정보 찾기
+    origin_img_filename = f"frame_{frame_id:05d}.jpg"
+    match = next((item for item in name_and_bbox if origin_img_filename in item["origin_img_path"]), None)
+    if not match:
+        print(f"frame_{frame_id:05d}에 해당하는 원본 이미지가 없습니다.")
+        return
+
+    origin_img_path = match["origin_img_path"]
+    bbox_list = match["xyxy"]
+
+    # 3. bbox 인덱스를 기준으로 class + conf 결합한 라벨 생성
+    label_list = []
+    for r in results_for_frame:
+        crop_index = int(r["file_name"].split("_")[-1].split(".")[0])  # 예: "00" from crop_00
+        if crop_index < len(bbox_list):
+            label = f"{r['class']} ({r['conf']:.2f})"
+            label_list.append((crop_index, label))
+
+    # 4. bbox 순서에 맞춰 라벨 정렬
+    sorted_label_list = [None] * len(bbox_list)
+    for idx, label in label_list:
+        sorted_label_list[idx] = label
+
+    # None인 라벨은 unknown으로 채움
+    sorted_label_list = [l if l else "unknown" for l in sorted_label_list]
+
+    # 5. 시각화 후 저장
+    output_path = os.path.join(save_dir, f"final_frame_{frame_id:05d}.jpg")
+    draw_class_labels_with_conf(origin_img_path, bbox_list, sorted_label_list, output_path, font_base_path)
+    print(f"저장 완료: {output_path}")
+
+
+def visualize_all_frames(enhanced_bbox_results, name_and_bbox, save_dir, font_base_path):
+    """
+    bbox에 클래스 이름을 써서 원본 이미지에 그리기 (전체 이미지)
+    """
+    # 존재하는 프레임 id 추출 (예: frame_00000 -> 0)
+    frame_ids = set([
+        int(item['file_name'].split("_")[1]) for item in enhanced_bbox_results
+    ])
+    frame_ids = sorted(frame_ids)
+
+    print(f"총 {len(frame_ids)}개의 프레임을 처리합니다...")
+
+    for frame_id in frame_ids:
+        try:
+            visualize_one_frame(frame_id, enhanced_bbox_results, name_and_bbox, save_dir, font_base_path)
+        except Exception as e:
+            print(f"frame_{frame_id:05d} 처리 중 오류 발생: {e}")
+            exit(0)
+
+
+def build_grid_boxes(img, rows=3, cols=3):
+    """
+    이미지 크기에 맞춰 rows×cols 그리드 영역을 만듬
+    각 영역의 좌표는 (min_x1, min_y1, max_x2, max_y2) 형태로 반환
+    좌표는 OpenCV 슬라이싱과 동일하게 x2,y2는 'exclusive' 경계임 (slice에 그대로 사용 가능)
+    """
+    h, w = img.shape[:2]
+    x_edges = np.linspace(0, w, cols + 1, dtype=int)  # [0, ..., w]
+    y_edges = np.linspace(0, h, rows + 1, dtype=int)  # [0, ..., h]
+
+    boxes = {}  # id: (min_x1, min_y1, max_x2, max_y2)
+    # 번호는 예시 이미지처럼 좌→우, 상→하로 1~9 부여
+    # 1 2 3
+    # 4 5 6
+    # 7 8 9
+    cell_id = 1
+    for r in range(rows):
+        for c in range(cols):
+            x1, x2 = x_edges[c], x_edges[c+1]
+            y1, y2 = y_edges[r], y_edges[r+1]
+            boxes[cell_id] = (x1, y1, x2, y2)
+            cell_id += 1
+    return boxes
+
+
+def select_cat_label(enhanced_bbox_results, name_and_bbox, bowl_where_cell):
+    """
+    여러 마리가 촬영되는 상황에서 어느 고양이가 밥을 먹고 있는가
+    """
+    # 1. 어떤 프레임 이미지인지 frame_id로 구분
+    frame_ids = set([
+        int(item['file_name'].split("_")[1]) for item in enhanced_bbox_results
+    ])
+
+    frame_ids = sorted(frame_ids)
+    grid_boxes = {} # 영역별 x1,y1,x2,y2 좌표 - 1 : (x1,y1,x2,y2)
+    candidate_bbox_and_label = [] # [(x1,y1,x2,y2,label), ...]
+
+    # 2. 각 프레임 이미지의 crop된 이미지의 bbox 좌표 순회
+    for idx,frame_id in enumerate(frame_ids):
+        # 3. frame_id로부터 관련 결과 추출
+        target_filename_prefix = f"frame_{frame_id:05d}_crop_"
+
+        # 해당 frame에 대한 예측 정보만 필터링
+        results_for_frame = [r for r in enhanced_bbox_results if r["file_name"].startswith(target_filename_prefix)]
+
+        # 4. name_and_bbox에서 해당 프레임에 대한 정보 찾기
+        origin_img_filename = f"frame_{frame_id:05d}.jpg"
+        match = next((item for item in name_and_bbox if origin_img_filename in item["origin_img_path"]), None)
+        if not match:
+            print(f"frame_{frame_id:05d}에 해당하는 원본 이미지가 없습니다.")
+            continue
+
+        origin_img_path = match["origin_img_path"] # 영역을 구하기 위한 샘플 이미지
+        bbox_list = match["xyxy"] # 
+
+        if idx==0:
+            img_cv = cv2.imread(origin_img_path)
+            grid_boxes = build_grid_boxes(img=img_cv, rows=3, cols=3)
+
+        # 5. bbox 인덱스를 기준으로 class + conf 결합한 라벨 생성
+        label_list = []
+        for r in results_for_frame:
+            crop_index = int(r["file_name"].split("_")[-1].split(".")[0])  # 예: "00" from crop_00
+            if crop_index < len(bbox_list):
+                #label = f"{r['class']} ({r['conf']:.2f})"
+                label = str(r['class'])
+                label_list.append((crop_index, label))
+
+        # 6. bbox 순서에 맞춰 라벨 정렬
+        sorted_label_list = [None] * len(bbox_list)
+        for idx, label in label_list:
+            sorted_label_list[idx] = label
+
+        # None인 라벨은 unknown으로 채움
+        sorted_label_list = [l if l else "unknown" for l in sorted_label_list]
+
+        # 7. bbox좌표와 라벨을 매칭해 순회
+        for (x1, y1, x2, y2), label in zip(bbox_list, sorted_label_list):
+            if label=='unknown': # unknown이면 pass
+                continue
+            x1,y1,x2,y2 = int(x1),int(y1),int(x2),int(y2)
+            grid_min_x1,grid_min_y1,grid_max_x2,grid_max_y2 = grid_boxes[bowl_where_cell] # 영역 좌표
+            if grid_min_x1<=x1<=grid_max_x2 and grid_min_y1<=y1<=grid_max_y2: # 해당 영역에 속하면
+                candidate_bbox_and_label.append(label) # 리스트 삽입
+        
+    # 8. bowl_where_cell 영역에 속하는 bbox좌표들에 대한 라벨이 누가 가장 많이 나왔느냐
+    if candidate_bbox_and_label==[]:
+        return ""
+    else:
+        counter = Counter(candidate_bbox_and_label)
+        print(counter)
+        most_common = counter.most_common(1)[0][0]  # [(label, count)]에서 label 추출
+        return most_common
+
+
+def images_to_video(image_dir, output_path, fps=15): # 안씀. 일단 임시로 냅둠
+    """
+    프레임별 이미지 -> 동영상(mp4)
+    """
+    images = sorted([img for img in os.listdir(image_dir) if img.endswith(".jpg")])
+    if not images:
+        print("No images found.")
+        return
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    first_frame = cv2.imread(os.path.join(image_dir, images[0]))
+    height, width, _ = first_frame.shape
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    for img in images:
+        frame = cv2.imread(os.path.join(image_dir, img))
+        video_writer.write(frame)
+
+    video_writer.release()
+    print(f"[완료] {len(images)}장의 프레임을 기반으로 {output_path} 영상 생성 완료")
+
+
+def _natural_key(s):
+    # frame_00001.jpg → 자연 정렬
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', os.path.basename(s))]
+
+def _ensure_dir(p):
+    d = os.path.dirname(p)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+def images_to_web_mp4(image_dir, output_path, fps=15, keep_intermediate=False):
+    """
+    프레임 이미지들을 영상으로 만들고, ffmpeg로 웹 호환(H.264 + faststart) mp4로 변환.
+    1) OpenCV로 임시 mp4 생성 (코덱은 avc1 우선 → mp4v 폴백)
+    2) ffmpeg로 libx264 + yuv420p + +faststart 변환
+    3) 최종 mp4 경로를 반환 (ffmpeg 없으면 임시 mp4 반환)
+
+    Args:
+        image_dir: 프레임 이미지(.jpg) 폴더
+        output_path: 최종 저장할 mp4 경로
+        fps: 프레임 레이트
+        keep_intermediate: True면 임시 mp4 유지
+
+    Returns:
+        최종 mp4 경로 (str)
+    
+    opencv-python이 mp4로 만들 시 -> H.264(avc1) 코텍 오류 뜸.
+    이를 해결하고자, FFmpeg CLI형식으로 변환했기에 기능 정상 작동함.
+    다음의 로그는 무시하면됨.
+    aiservice_container  | [ERROR:0@1307.220] global cap_ffmpeg_impl.hpp:3207 open Could not find encoder for codec_id=27, error: Encoder not found
+    aiservice_container  | [ERROR:0@1307.220] global cap_ffmpeg_impl.hpp:3285 open VIDEOIO/FFMPEG: Failed to initialize VideoWriter
+    """
+    # 0) 입력 이미지 수집 
+    frame_paths = sorted(glob(os.path.join(image_dir, "*.jpg")), key=_natural_key)
+    if not frame_paths:
+        raise FileNotFoundError(f"No images found in: {image_dir}")
+
+    # 1) 첫 프레임 로드 & 크기 
+    first = cv2.imread(frame_paths[0])
+    if first is None:
+        raise RuntimeError(f"Failed to read first frame: {frame_paths[0]}")
+    h, w = first.shape[:2]
+
+    # 2) 출력 디렉토리 준비 
+    _ensure_dir(output_path)
+
+    # 임시 mp4 (raw): output_path와 같은 디렉토리에 생성
+    root, ext = os.path.splitext(output_path)
+    tmp_raw = root + ".__raw__.mp4"
+
+    # 3) OpenCV로 임시 mp4 만들기 (avc1 → mp4v 폴백)
+    def _open_writer(path, fourcc_str):
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+        writer = cv2.VideoWriter(path, fourcc, fps, (w, h))
+        return writer
+
+    writer = _open_writer(tmp_raw, "avc1")
+    if not writer.isOpened():
+        print("[images_to_web_mp4] avc1 인코딩 실패 → mp4v로 폴백합니다.")
+        writer = _open_writer(tmp_raw, "mp4v")
+    if not writer.isOpened():
+        raise RuntimeError("Failed to open VideoWriter with both 'avc1' and 'mp4v'.")
+
+    written = 0
+    for p in frame_paths:
+        frame = cv2.imread(p)
+        if frame is None:
+            continue
+        if frame.shape[1] != w or frame.shape[0] != h:
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
+        writer.write(frame)
+        written += 1
+    writer.release()
+
+    if written == 0 or not os.path.isfile(tmp_raw) or os.path.getsize(tmp_raw) == 0:
+        raise RuntimeError("No frames were written or tmp_raw not created properly.")
+
+    # 4) ffmpeg 변환 (웹 호환 H.264 + faststart) 
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        # ffmpeg 미설치 → 임시 mp4 그대로 사용
+        print("[images_to_web_mp4][WARN] ffmpeg not found. Returning raw mp4 as-is.")
+        # raw 파일을 원하는 최종 경로로 이동/복사
+        if tmp_raw != output_path:
+            # 기존 output_path가 있을 수 있으니 덮어쓰기
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            os.replace(tmp_raw, output_path)
+        return output_path
+
+    # ffmpeg 명령: H.264, yuv420p, baseline, +faststart (오디오 없음)
+    cmd = [
+        ffmpeg_path, "-y", "-i", tmp_raw,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-profile:v", "baseline", "-level", "3.1",
+        "-movflags", "+faststart",
+        "-r", str(fps),
+        "-an",
+        output_path
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        # 변환 실패 시 raw mp4를 반환 (최소한 업로드는 가능하도록)
+        print(f"[images_to_web_mp4][WARN] ffmpeg convert failed: {e}\n"
+              f"stderr: {e.stderr.decode(errors='ignore')[:500]}")
+        if tmp_raw != output_path:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            os.replace(tmp_raw, output_path)
+        return output_path
+
+    # 5) 임시 파일 정리 
+    if not keep_intermediate and os.path.exists(tmp_raw):
+        try:
+            os.remove(tmp_raw)
+        except Exception:
+            pass
+
+    print(f"[완료] {written}장의 프레임으로 웹 호환 mp4 생성: {output_path}")
+    return output_path

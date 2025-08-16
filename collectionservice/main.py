@@ -115,35 +115,47 @@ async def receive_event_for_bbox_video(event: schemas.EventRequest, db: Session 
     
     user_id = event.user_id
     origin_video_url = event.origin_video_url
+    bowl_where_cell = event.bowl_where_cell
+    cat_name = ""
+    bbox_video_url = ""
 
     # Flask 서버(aiservice 컨테이너)로 POST 요청
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(18000.0)) as client:
             resp = await client.post(
                 "http://aiservice:8001/api/aiservice/upload/bbox",
-                json={"user_id": user_id, "origin_video_url": origin_video_url}, # 바디
+                json={"user_id": user_id, "origin_video_url": origin_video_url, "bowl_where_cell": bowl_where_cell}, # 바디
                 headers={"Content-Type": "application/json"} # 헤더
             )
             resp.raise_for_status()
             data = resp.json()  # {"cat_name": str, "bbox_video_url": str}
 
-            # event_schemas = schemas.EventCreate(
-            #     user_id = user_id,
-            #     event_time = event.event_time,
-            #     duration_seconds = event.duration_seconds,
-            #     weight_info = event.weight_info,
-            #     origin_video_url = origin_video_url,
-            #     bbox_video_url = data['bbox_video_url'],
-            #     event_type = event.event_type,
-            #     cat_name = data['cat_name']
-            # )
-            # created_evnet = crud.create_event(db=db, event=event_schemas)
-            # print("DB에 성공적으로 저장:", created_event.__dict__)
+            cat_name = data['cat_name']
+            bbox_video_url = data['bbox_video_url']
+
+            event_schemas = schemas.EventCreate(
+                user_id = user_id,
+                event_time = event.event_time,
+                duration_seconds = event.duration_seconds,
+                weight_info = event.weight_info,
+                origin_video_url = origin_video_url,
+                bbox_video_url = data['bbox_video_url'],
+                event_type = event.event_type,
+                cat_name = data['cat_name']
+            )
+
+            created_event = crud.create_event(db=db, event=event_schemas)
+            print("DB에 성공적으로 저장:", created_event.__dict__)
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"aiservice의 make_and_upload_bbox_video() 호출 실패: {e}") from e
     
 
-    return {"status":"success", "message":"BBOX 영상 완료"}
+    return {
+        "status":"success", "message":"BBOX 영상 완료", "user_id":user_id,
+        "event_time":event.event_time, "duration_seconds":event.duration_seconds, "weight_info":event.weight_info,
+        "origin_video_url":origin_video_url, "bbox_video_url":bbox_video_url, "event_type":event.event_type,
+        "cat_name":cat_name
+    }
 
 #####################################################################################################
 

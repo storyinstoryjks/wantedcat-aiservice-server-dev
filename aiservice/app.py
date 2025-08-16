@@ -6,6 +6,7 @@ from common.learning import *
 from dotenv import load_dotenv
 from ultralytics import YOLO
 from threading import Lock
+import time
 
 
 # --- 전역 설정(앱, 경로, ...) ---
@@ -49,6 +50,7 @@ BASE_URL = app.root_path
 X_API_KEY = os.getenv("X_API_KEY")
 YOLO0_BEST_MODEL = None
 YOLO2_BEST_MODEL = None
+reconstructed_count = 1
 
 
 # --- API 엔드포인트 정의 ---
@@ -82,6 +84,8 @@ def prepare_yolo_model():
     """
     고양이 등록 플로우 : yolo모델(2번) 제작 및 blob storage에 저장.
     """
+
+    start_time = time.time()
 
     ###  1. (React->수집서버)에서 훈련 대상 고객id를 받아오기 ###
     data = request.get_json()
@@ -222,6 +226,8 @@ def prepare_yolo_model():
     target = os.path.join(BASE_URL, f"tmp/yolo2_train/{user_id}")
     purge_directory(target, safety_prefix=os.path.join(BASE_URL, "tmp/yolo2_train"))
 
+    end_time = time.time()
+    print(f"총 실행 시간: {(end_time-start_time)//60}분")
 
     return jsonify(
         status_code=200, 
@@ -237,14 +243,19 @@ def make_and_upload_bbox_video():
     """
     실제 환경 플로우 : 홈캠 영상 -> bbox 영상 만들기
     """
+    global reconstructed_count
+
     # 1. 수집서버에서 특정 고양이의 식사 이벤트 정보를 넘겨받는다.
+    start_time = time.time()
     print("[1번] 수집서버로부터 특정 고양이의 식사 이벤트 정보 받기")
     print("="*100)
     data = request.get_json()
     user_id = data.get('user_id')
     origin_video_url = data.get('origin_video_url')
+    bowl_where_cell = int(data.get('bowl_where_cell'))
     print(f"user_id: {user_id}")
     print(f"origin_video_url: {origin_video_url}")
+    print(f"bowl_where_cell(1~9): {bowl_where_cell}")
     print()
 
     # 2-1. YOLO(0번) 모델 준비
@@ -291,8 +302,7 @@ def make_and_upload_bbox_video():
                                             project_name=f"predict_frames_all_yolo0/{user_id}",
                                             conf=0.5,
                                             iou=0.7)
-    print(f"name_and_bbox 구성 확인하기")
-    print(name_and_bbox[0])
+    print(f"name_and_bbox 구성 확인하기:", name_and_bbox[0])
     print()
 
     # 6. 예측된 각 이미지의 bbox 영역 Crop하기
@@ -304,7 +314,7 @@ def make_and_upload_bbox_video():
                                              bbox_list=e['xyxy'], 
                                              save_dir=os.path.join(BASE_URL, f'frames/cropped_bboxed_all/{user_id}'))
         cropped_images.append(cropped_image)
-    print(cropped_images[0])
+    print('cropped_images 요소 확인하기:', cropped_images[0])
     print()
 
     # 7. 화질 개선
@@ -315,11 +325,110 @@ def make_and_upload_bbox_video():
     print("화질 개선 완료")
 
     # 8. YOLO2로 라벨 예측
+    print("[8번] YOLO2로 고양이 라벨 예측")
+    print("="*100)
+    enhanced_bbox_results = classify_crops_with_yolo2(crop_dir=os.path.join(BASE_URL, f"frames/enhanced_v1_cropped_bboxes_all/{user_id}"), 
+                                                       project_name=os.path.join(BASE_URL,f"frames/enhanced_yolo2_all/{user_id}"), 
+                                                       enhance_version="v1", 
+                                                       yolo_model=YOLO2_BEST_MODEL)
+    print(f"enhanced_bbox_results 구성 확인하기: {enhanced_bbox_results[0]}")
+    unknown_cnt=0
+    for i in enhanced_bbox_results:
+        if i['class']=='unknown':
+            unknown_cnt+=1
+    print(f"전체 crop 이미지 대비 unknown 수 : ({unknown_cnt} / {len(enhanced_bbox_results)}) (라벨링 시행률: {100-(unknown_cnt / len(enhanced_bbox_results))*100:.2f}%)")
+    print()
 
+    # 9. 원본 이미지에 class(라벨) 및 conf 그리기
+    print("[9번] 원본 이미지에 고양이명/신뢰도 REPAINT")
+    print("="*100)
+    path = download_blob_via_api( # 한글로 repaint하기 위해, 폰트 다운로드(from Azure Blob Storage)
+                    api_base_url="http://collectionservice:8000",
+                    x_api_key=X_API_KEY,
+                    container_name="font",
+                    blob_path="NanumSquareR.ttf",
+                    download_dir=os.path.join(BASE_URL, "font"),
+                    timeout_sec=14400
+                )
+    print("NanumSquareR.ttf 폰트 다운로드 완료")
+    print()
+    visualize_all_frames( # repaint 시작
+        enhanced_bbox_results=enhanced_bbox_results,
+        name_and_bbox=name_and_bbox,
+        save_dir=os.path.join(BASE_URL, f"frames/final_all/{user_id}"),
+        font_base_path=os.path.join(BASE_URL, "font")
+    )
+    print()
+
+    # 10. 동영상(mp4) 제작하기
+    print("[10번] REPAINT 이미지들을 mp4로 제작하기")
+    print('='*100)
+    final_mp4 = images_to_web_mp4(image_dir=os.path.join(BASE_URL, f"frames/final_all/{user_id}"),
+                                  output_path=os.path.join(BASE_URL, f"videos/reconstructed/{user_id}/bbox_video_{reconstructed_count}.mp4"),
+                                  fps=15,
+                                  keep_intermediate=False)
+    bbox_video_idx = reconstructed_count
+    reconstructed_count+=1
+    print()
+
+    # 11. 예측된 라벨 중, 식기와 가장 가까운 고양이 라벨 선택
+    print("[11번] 고양이 라벨 선택하기")
+    print('='*100)
+    cat_name = select_cat_label(enhanced_bbox_results=enhanced_bbox_results, 
+                                name_and_bbox=name_and_bbox,
+                                bowl_where_cell=bowl_where_cell)
+    print(f"완료: {cat_name}")
+    print()
+
+    # 12. BBOX 영상을 Azure Blob Storage에 업로드
+    print("[12번] BBOX 영상을 Azure Blob Storage에 업로드")
+    print('='*100)
+    bbox_video_url = upload_bbox_video_via_api(api_base_url="http://collectionservice:8000",
+                                               x_api_key=X_API_KEY,
+                                               user_id=f"{user_id}",
+                                               idx=bbox_video_idx,
+                                               base_dir=os.path.join(BASE_URL, "videos/reconstructed"),
+                                               container_name="history",
+                                               timeout_sec=14400,
+                                               overwrite=True)
+    print(f"완료 : {bbox_video_url}")
+    print()
+
+    # 13. 최종 폴더 정리하기 (오류가 나서 그냥 폴더에 보관한 채로 이어서 진행하는걸로 타협)
+    # # /app/videos/origin/your_user_id # 3
+    # target = os.path.join(BASE_URL, f'videos/origin/{user_id}'),
+    # purge_directory(target, safety_prefix=os.path.join(BASE_URL, "videos/origin"))
+    # # /app/frames/origin/your_user_id # 4
+    # target = os.path.join(BASE_URL,f"frames/origin/{user_id}")
+    # purge_directory(target, safety_prefix=os.path.join(BASE_URL, "frames/origin"))
+    # # /app/frames/predict_frames_all_yolo0/your_user_id/predict # 5
+    # target = os.path.join(BASE_URL,f"frames/predict_frames_all_yolo0/{user_id}/predict")
+    # purge_directory(target, safety_prefix=os.path.join(BASE_URL, "frames/predict_frames_all_yolo0"))
+    # # /app/frames/cropped_bboxed_all/your_user_id # 6
+    # target = os.path.join(BASE_URL, f'frames/cropped_bboxed_all/{user_id}')
+    # purge_directory(target, safety_prefix=os.path.join(BASE_URL, "frames/cropped_bboxed_all"))
+    # # /app/frames/enhanced_v1_cropped_bboxes_all/your_user_id # 7
+    # target = os.path.join(BASE_URL, f"frames/enhanced_v1_cropped_bboxes_all/{user_id}")
+    # purge_directory(target, safety_prefix=os.path.join(BASE_URL, "frames/enhanced_v1_cropped_bboxes_all"))
+    # # /app/frames/enhanced_yolo2_all/your_user_id/v1/predict # 8
+    # target = os.path.join(BASE_URL,f"frames/enhanced_yolo2_all/{user_id}/v1/predict")
+    # purge_directory(target, safety_prefix=os.path.join(BASE_URL, "frames/enhanced_yolo2_all"))
+    # # /app/frames/final_all/your_user_id # 9
+    # target = os.path.join(BASE_URL, f"frames/final_all/{user_id}")
+    # purge_directory(target, safety_prefix=os.path.join(BASE_URL, "frames/final_all"))
+    # # /app/videos/reconstructed/your_user_id # 10
+    # target = os.path.join(BASE_URL, f"videos/reconstructed/{user_id}")
+    # purge_directory(target, safety_prefix=os.path.join(BASE_URL, "frames/reconstructed"))
+
+
+    # 14. 총 실행 시간
+    end_time = time.time()
+    print(f"총 실행 시간: {(end_time-start_time)//60}분")
+    print()
 
     return jsonify(
-        cat_name="cat_name",
-        bbox_video_url="bbox_video_url"
+        cat_name=cat_name,
+        bbox_video_url=bbox_video_url
     ),200
 
 if __name__ == '__main__':

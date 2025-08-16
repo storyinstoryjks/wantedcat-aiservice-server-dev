@@ -17,6 +17,7 @@ class EventRequest(BaseModel):
     weight_info: str
     origin_video_url: str
     event_type: str
+    bowl_where_cell: str
 
 class EventCreate(BaseModel):
     user_id: str
